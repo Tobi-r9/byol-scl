@@ -204,6 +204,7 @@ class BYOL(nn.Module):
                 p = 0.2
             ),
             T.RandomResizedCrop((image_size, image_size)),
+            #TODO: What normalizing constants are these? Should I even use them?
             T.Normalize(
                 mean=torch.tensor([0.485, 0.456, 0.406]),
                 std=torch.tensor([0.229, 0.224, 0.225])),
@@ -265,8 +266,8 @@ class BYOL(nn.Module):
         images = torch.cat((image_one, image_two), dim = 0)
 
         online_projections, _ = self.online_encoder(images)
+        #TODO: if not self.scl
         online_predictions = self.online_predictor(online_projections)
-
         online_pred_one, online_pred_two = online_predictions.chunk(2, dim = 0)
 
         with torch.no_grad():
@@ -276,6 +277,16 @@ class BYOL(nn.Module):
             target_projections = target_projections.detach()
 
             target_proj_one, target_proj_two = target_projections.chunk(2, dim = 0)
+        #TODO
+        # if self.scl:
+        #     reshape target target one
+        #     reshape target two
+        #     concat online one with target two
+        #     concat online two with target one
+        #     get logits 1
+        #     get logits 2
+        #     loss_fn_1
+        #     loss_fn_2
 
         loss_one = loss_fn(online_pred_one, target_proj_two.detach())
         loss_two = loss_fn(online_pred_two, target_proj_one.detach())
