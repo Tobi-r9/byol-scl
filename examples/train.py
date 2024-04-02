@@ -4,19 +4,15 @@ import multiprocessing
 from pathlib import Path
 from PIL import Image
 import zipfile
+import numpy as np
 
 import torch
 from torchvision import models, transforms
 from torch.utils.data import DataLoader, Dataset
 
 from byol_pytorch import BYOL
-import pytorch_lightning as pl
-
-# test model, a resnet 50
 
 resnet = models.resnet50(pretrained=False)
-
-# arguments
 
 parser = argparse.ArgumentParser(description='byol-lightning-test')
 
@@ -25,41 +21,25 @@ parser.add_argument('--image_folder', type=str, required = True,
 
 args = parser.parse_args()
 
-# constants
-
-BATCH_SIZE = 32
-EPOCHS     = 1000
+BATCH_SIZE = 128
+EPOCHS     = 3
 LR         = 3e-4
 NUM_GPUS   = 1
 IMAGE_SIZE = 32
 IMAGE_EXTS = ['.jpg', '.png', '.jpeg']
 NUM_WORKERS = multiprocessing.cpu_count()
+SCL = False
 
-# pytorch lightning module
+learner = BYOL(
+    resnet,
+    scl=SCL,
+    batch_size=BATCH_SIZE,
+    pool_kernel_size=8,
+    image_size = IMAGE_SIZE,
+    hidden_layer = 'avgpool'
+)
 
-class SelfSupervisedLearner(pl.LightningModule):
-    def __init__(self, net, **kwargs):
-        super().__init__()
-        self.learner = BYOL(net, **kwargs)
-
-    def forward(self, images):
-        return self.learner(images)
-
-    def training_step(self, images, _):
-        loss = self.forward(images)
-        return {'loss': loss}
-
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=LR)
-
-    def on_before_zero_grad(self, _):
-        if self.learner.use_momentum:
-            self.learner.update_moving_average()
-
-# images dataset
-
-def expand_greyscale(t):
-    return t.expand(3, -1, -1)
+opt = torch.optim.Adam(learner.parameters(), lr=3e-4)
 
 class ImagesDataset(Dataset):
     def __init__(self, folder, image_size):
@@ -67,11 +47,16 @@ class ImagesDataset(Dataset):
         self._zipfile = zipfile.ZipFile(folder)
         self.folder = self._zipfile.namelist()
         self.paths = []
+        class_names = []
 
         for path in sorted(self.folder):
             _, ext = os.path.splitext(path)
             if ext.lower() in IMAGE_EXTS:
                 self.paths.append(path)
+            class_names.append(os.path.basename(path).split("_")[0])
+
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        self.classes = [sorted_classes[x] for x in class_names]
 
         print(f'{len(self.paths)} images found')
 
@@ -86,32 +71,27 @@ class ImagesDataset(Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
+        out_dict = {}
         with self._zipfile.open(path, "r") as f:
             img = Image.open(f)
             img.load()
         img = img.convert('RGB')
-        return self.transform(img)
+        out_dict["y"] = np.array(self.classes[index], dtype=np.int64)
+        return self.transform(img), out_dict
+    
 
-# main
+ds = ImagesDataset(args.image_folder, IMAGE_SIZE)
+train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+train_loader = iter(train_loader)
 
-if __name__ == '__main__':
-    ds = ImagesDataset(args.image_folder, IMAGE_SIZE)
-    train_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
+for i in range(EPOCHS):
+    images, classes = next(train_loader)
+    loss = learner(images)
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    learner.update_moving_average() # update moving average of target encoder
+    print(loss.item())
 
-    model = SelfSupervisedLearner(
-        resnet,
-        image_size = IMAGE_SIZE,
-        hidden_layer = 'avgpool',
-        projection_size = 256,
-        projection_hidden_size = 4096,
-        moving_average_decay = 0.99
-    )
-
-    trainer = pl.Trainer(
-        accelerator = "auto",
-        max_epochs = EPOCHS,
-        accumulate_grad_batches = 1,
-        sync_batchnorm = True
-    )
-
-    trainer.fit(model, train_loader)
+# save your improved network
+torch.save(resnet.state_dict(), './improved-net.pt')
