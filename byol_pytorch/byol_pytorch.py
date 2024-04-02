@@ -44,10 +44,14 @@ def MaybeSyncBatchnorm(is_distributed = None):
 
 # loss fn
 
-def loss_fn(x, y):
+def ssl_loss(x, y):
     x = F.normalize(x, dim=-1, p=2)
     y = F.normalize(y, dim=-1, p=2)
     return 2 - 2 * (x * y).sum(dim=-1)
+
+def scl_loss(x, y):
+    return F.cross_entropy(x, y)
+
 
 # augmentation utils
 
@@ -103,6 +107,16 @@ def SimSiamMLP(dim, projection_size, hidden_size=4096, sync_batchnorm=None):
 # a wrapper class for the base neural network
 # will manage the interception of the hidden layer output
 # and pipe it into the projecter and predictor nets
+
+class Linear(nn.Module):
+    def __init__(self, num_classes=11, projection_size=256) -> None:
+        super().__init__()
+        self.linear_layer = nn.Linear(projection_size, num_classes)
+        self.softmax = nn.Softmax(dim=0)
+
+    def forward(self, x):
+        h = self.linear_layer(x)
+        return self.softmax(h)
 
 class NetWrapper(nn.Module):
     def __init__(self, net, projection_size, projection_hidden_size, layer = -2, use_simsiam_mlp = False, sync_batchnorm = None):
@@ -178,6 +192,9 @@ class BYOL(nn.Module):
         self,
         net,
         image_size,
+        scl=True,
+        pool_kernel_size=8,
+        batch_size=32,
         hidden_layer = -2,
         projection_size = 256,
         projection_hidden_size = 4096,
@@ -189,9 +206,14 @@ class BYOL(nn.Module):
     ):
         super().__init__()
         self.net = net
+        self.scl = scl
+        self.batch_size = batch_size
+        if self.scl:
+            assert projection_size % pool_kernel_size == 0, "projection_size % pool_kernel == 0 is required"
+            self.pool = nn.MaxPool1d(kernel_size=pool_kernel_size, stride=pool_kernel_size)
+            self.softmax = nn.Softmax(dim=0)
 
         # default SimCLR augmentation
-
         DEFAULT_AUG = torch.nn.Sequential(
             RandomApply(
                 T.ColorJitter(0.8, 0.8, 0.8, 0.2),
@@ -226,14 +248,16 @@ class BYOL(nn.Module):
         self.target_encoder = None
         self.target_ema_updater = EMA(moving_average_decay)
 
-        self.online_predictor = MLP(projection_size, projection_size, projection_hidden_size)
+        output_size = self.batch_size if self.scl else projection_size
+        dim = projection_size + self.batch_size * (projection_size // pool_kernel_size) if scl else projection_size
+        self.predictor = SimSiamMLP(dim=dim, projection_size=output_size, hidden_size=projection_hidden_size)
 
         # get device of network and make wrapper same device
         device = get_module_device(net)
         self.to(device)
 
         # send a mock image tensor to instantiate singleton parameters
-        self.forward(torch.randn(2, 3, image_size, image_size, device=device))
+        self.forward(torch.randn(self.batch_size, 3, image_size, image_size, device=device))
 
     @singleton('target_encoder')
     def _get_target_encoder(self):
@@ -257,39 +281,41 @@ class BYOL(nn.Module):
         return_projection = True
     ):
         assert not (self.training and x.shape[0] == 1), 'you must have greater than 1 sample when training, due to the batchnorm in the projection layer'
-
         if return_embedding:
             return self.online_encoder(x, return_projection = return_projection)
 
         image_one, image_two = self.augment1(x), self.augment2(x)
-
         images = torch.cat((image_one, image_two), dim = 0)
 
         online_projections, _ = self.online_encoder(images)
-        #TODO: if not self.scl
-        online_predictions = self.online_predictor(online_projections)
-        online_pred_one, online_pred_two = online_predictions.chunk(2, dim = 0)
+
+        if not self.scl:
+            online_predictions = self.predictor(online_projections)
+            online_pred_one, online_pred_two = online_predictions.chunk(2, dim = 0)
 
         with torch.no_grad():
             target_encoder = self._get_target_encoder() if self.use_momentum else self.online_encoder
-
             target_projections, _ = target_encoder(images)
             target_projections = target_projections.detach()
-
             target_proj_one, target_proj_two = target_projections.chunk(2, dim = 0)
-        #TODO
-        # if self.scl:
-        #     reshape target target one
-        #     reshape target two
-        #     concat online one with target two
-        #     concat online two with target one
-        #     get logits 1
-        #     get logits 2
-        #     loss_fn_1
-        #     loss_fn_2
 
-        loss_one = loss_fn(online_pred_one, target_proj_two.detach())
-        loss_two = loss_fn(online_pred_two, target_proj_one.detach())
+        if self.scl:
+            online_proj_one, online_proj_two = online_projections.chunk(2, dim=0)
+            target_proj_one = target_proj_one.reshape(1, -1)
+            target_proj_two = target_proj_two.reshape(1, -1)
+            target_proj_one_pool = self.pool(target_proj_one).repeat(online_proj_one.shape[0], 1)
+            target_proj_two_pool = self.pool(target_proj_two).repeat(online_proj_two.shape[0], 1) 
+            input_one = torch.cat([online_proj_one, target_proj_two_pool], dim=1)
+            input_two = torch.cat([online_proj_two, target_proj_one_pool], dim=1)
+            prediction_one = self.softmax(self.predictor(input_one))
+            prediction_two = self.softmax(self.predictor(input_two))
+            target = torch.eye(self.batch_size, self.batch_size)
+            loss_one = ssl_loss(prediction_one, target)
+            loss_two = ssl_loss(prediction_two, target)
 
+        else:
+            loss_one = ssl_loss(online_pred_one, target_proj_two.detach())
+            loss_two = ssl_loss(online_pred_two, target_proj_one.detach())
+            
         loss = loss_one + loss_two
         return loss.mean()
