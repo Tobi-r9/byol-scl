@@ -310,8 +310,8 @@ class BYOL(nn.Module):
             prediction_one = self.softmax(self.predictor(input_one))
             prediction_two = self.softmax(self.predictor(input_two))
             target = torch.eye(self.batch_size, self.batch_size)
-            loss_one = ssl_loss(prediction_one, target)
-            loss_two = ssl_loss(prediction_two, target)
+            loss_one = scl_loss(prediction_one, target)
+            loss_two = scl_loss(prediction_two, target)
 
         else:
             loss_one = ssl_loss(online_pred_one, target_proj_two.detach())
